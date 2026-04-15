@@ -31,3 +31,7 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# PoC A 輸出：全量 MD + SQLite FTS5（22MB + 58MB，不入 repo，examples/ 才放代表樣本）
+output/
+
