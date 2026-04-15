@@ -1,0 +1,64 @@
+name: Sync Taiwan Law MD
+
+on:
+  # 每週二 03:00 UTC（台北時間 11:00）
+  schedule:
+    - cron: "0 3 * * 2"
+  # 手動觸發（Actions UI）
+  workflow_dispatch:
+    inputs:
+      push_to_hf:
+        description: "實際推到 HuggingFace（需 HF_TOKEN secret）"
+        type: boolean
+        default: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install datasets pyarrow huggingface_hub
+
+      - name: Build MD + SQLite from lianghsun/tw-law
+        run: python scripts/build_tw_law_md.py
+
+      - name: Output size summary
+        run: |
+          echo "=== Laws ==="
+          find output/tw-law-md -name "*.md" | wc -l
+          echo "=== Size ==="
+          du -sh output/tw-law-md output/tw-law.db
+          echo "=== Sample ==="
+          ls output/tw-law-md | head -5
+
+      - name: Upload artifact (always, so we can inspect without HF)
+        uses: actions/upload-artifact@v4
+        with:
+          name: tw-law-md-${{ github.run_id }}
+          path: output/
+          retention-days: 14
+
+      - name: Push to HuggingFace Dataset
+        # 只在：(1) 排程觸發自動推 OR (2) 手動觸發且勾 push_to_hf
+        # 且 HF_TOKEN secret 已設定
+        if: >-
+          (github.event_name == 'schedule' ||
+           (github.event_name == 'workflow_dispatch' && inputs.push_to_hf == true))
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ vars.HF_REPO_ID || 'wooooody98/tw-law-md' }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::warning::HF_TOKEN secret 未設定，跳過推送"
+            exit 0
+          fi
+          python scripts/push_to_hf.py --repo-id "$HF_REPO_ID"

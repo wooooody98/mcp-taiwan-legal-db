@@ -144,12 +144,28 @@ async def query_regulation(law_name, article_no=""):
     return await reg_client.get_article(...)
 ```
 
-## 下一步
+## Pipeline
 
-- [ ] 範例展示：`examples/tw-law-md/` 放民法、憲法、勞基法三份作為樣本
-- [ ] GitHub Actions：每週二凌晨 3 點同步，push 到 `lawchat-oss/tw-law-md` 獨立 repo
-- [ ] 發布到 HuggingFace Dataset：`lawchat-oss/tw-law-md`（以 MD 為主要資產，SQLite 為次要）
+```
+.github/workflows/sync-tw-law-md.yml（每週二 11:00 台北時間）
+    ↓
+  python scripts/build_tw_law_md.py      # MOJ→MD + SQLite
+    ↓
+  GitHub Actions artifact（14 天保留期，任何人從 Actions UI 下載）
+    ↓ 若 HF_TOKEN secret 已設
+  python scripts/push_to_hf.py           # 推到 HF dataset
+    ↓
+  https://huggingface.co/datasets/<repo-id>
+```
+
+## 完成狀態
+
+- [x] 全量 1343 部法規 MD + SQLite FTS5 產出
+- [x] `examples/tw-law-md/` 放 3 份代表樣本（民法、憲法、勞基法）
+- [x] GitHub Actions 每週同步 + 產生 artifact
+- [x] HuggingFace dataset push 腳本（含 dataset card）
 - [ ] MCP 整合：`query_regulation` 加本地 SQLite fast path
+- [ ] 搬到獨立 repo `lawchat-oss/tw-law-md`（待評估）
 
 ## 授權
 
