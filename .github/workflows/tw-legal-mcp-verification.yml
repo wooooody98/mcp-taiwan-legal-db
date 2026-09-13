@@ -22,8 +22,27 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install verified upstream legal MCP source
-        run: python -m pip install --disable-pip-version-check 'git+https://github.com/lawchat-oss/mcp-taiwan-legal-db.git@03194e7b0a7437c7ed5e281d6d92c4a6df66ac65' requests
+      - name: Install upstream source with compatible v1 MCP SDK
+        run: python -m pip install --disable-pip-version-check 'mcp[cli]>=1,<2' 'git+https://github.com/lawchat-oss/mcp-taiwan-legal-db.git@03194e7b0a7437c7ed5e281d6d92c4a6df66ac65' requests
+      - name: Record public service authentication metadata and preserve HTTP errors
+        run: |
+          python - <<'PY'
+          import json, pathlib, requests
+          out = pathlib.Path('mcp-results'); out.mkdir(exist_ok=True)
+          rows = []
+          for path in ['/v1/health', '/.well-known/oauth-protected-resource', '/.well-known/oauth-authorization-server']:
+              try:
+                  r = requests.get('https://tlr.dr-legal.com.tw'+path, timeout=15)
+                  rows.append({'path':path,'status':r.status_code,'www_authenticate':r.headers.get('WWW-Authenticate'),'body':r.text[:12000]})
+              except Exception as e:
+                  rows.append({'path':path,'error':repr(e)})
+          (out/'remote-service-metadata.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2))
+          print(json.dumps(rows,ensure_ascii=False))
+          p=pathlib.Path('diagnostics/mcp_probe.py')
+          s=p.read_text()
+          s=s.replace("            r.raise_for_status()", "            if r.status_code >= 400:\n                record('tw-legal-rag', 'http_error', {'status': r.status_code, 'www_authenticate': r.headers.get('WWW-Authenticate'), 'body': r.text[:12000]})\n            r.raise_for_status()")
+          p.write_text(s)
+          PY
       - name: Install browser used by official MCP client
         timeout-minutes: 3
         run: python -m playwright install --with-deps chromium
