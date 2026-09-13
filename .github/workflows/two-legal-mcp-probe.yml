@@ -1,24 +1,18 @@
 name: Two Taiwan Legal MCP live probe
-
 on:
   push:
     branches: [diagnostics/two-legal-mcp-20260913]
     paths: [.github/workflows/two-legal-mcp-probe.yml]
   workflow_dispatch:
-
 permissions:
   contents: read
-
 concurrency:
   group: two-legal-mcp-diagnostics
   cancel-in-progress: true
-
 jobs:
   live-probe:
     runs-on: ubuntu-24.04
     timeout-minutes: 8
-    env:
-      MCP_RESULTS_DIR: ${{ runner.temp }}/two-legal-mcp-results
     steps:
       - name: Install the upstream MCP server in an isolated environment
         run: |
@@ -28,38 +22,27 @@ jobs:
       - name: Install browser support for the official judicial site
         continue-on-error: true
         run: timeout 120s python -m playwright install --with-deps chromium
-      - name: Initialize both real MCP servers and run anonymous legal queries
+      - name: Initialize both MCP servers and run anonymous legal queries
         working-directory: ${{ runner.temp }}
+        env:
+          MCP_RESULTS_DIR: ${{ runner.temp }}/two-legal-mcp-results
         run: |
           python -u - <<'PY'
-          """Exercise both real MCP transports using anonymous legal research queries."""
-          import asyncio
-          import base64
-          import gzip
-          import importlib.metadata
-          import json
-          import os
-          import pathlib
-          import sys
-          import traceback
+          import asyncio, base64, gzip, importlib.metadata, json, os, pathlib, sys, traceback
           from datetime import datetime, timedelta, timezone
-          
           from mcp import ClientSession, StdioServerParameters
           from mcp.client.stdio import stdio_client
           from mcp.client.streamable_http import streamablehttp_client
-          
-          OUT = pathlib.Path(os.environ.get('MCP_RESULTS_DIR', 'mcp-results'))
+          OUT = pathlib.Path(os.environ['MCP_RESULTS_DIR'])
           OUT.mkdir(parents=True, exist_ok=True)
           records = []
-          
           def emit(event, **data):
               row = {'utc': datetime.now(timezone.utc).isoformat(), 'event': event, **data}
               records.append(row)
               line = json.dumps(row, ensure_ascii=False, default=str)
               with (OUT / 'records.jsonl').open('a', encoding='utf-8') as f:
                   f.write(line + '\n')
-              print(line if len(line) <= 28000 else line[:28000] + ' [preview only; complete response in artifact]', flush=True)
-          
+              print(line if len(line) <= 28000 else line[:28000] + ' [preview only; full response in artifact]', flush=True)
           def unpack(result):
               data = result.model_dump(mode='json')
               if isinstance(data.get('structuredContent'), dict):
@@ -71,72 +54,73 @@ jobs:
                       except (ValueError, TypeError):
                           pass
               return data
-          
           async def call(session, label, name, arguments):
               emit('tools_call_request', server=label, tool=name, arguments=arguments)
               try:
-                  result = await asyncio.wait_for(session.call_tool(name, arguments), 60)
+                  result = await asyncio.wait_for(session.call_tool(name, arguments), 65)
                   emit('tools_call_response', server=label, tool=name, response=result.model_dump(mode='json'))
                   return unpack(result)
               except Exception as exc:
                   emit('tools_call_error', server=label, tool=name, error=repr(exc))
                   return None
-          
+          def query_args(schema, text, count=5):
+              properties = schema.get('properties', {})
+              key = next((x for x in ('query', 'question', 'keyword') if x in properties), 'query')
+              args = {key: text}
+              for field, value in [('max_results', count), ('read_top', min(3, count))]:
+                  if field in properties:
+                      args[field] = value
+              return args
           async def remote():
               label = 'aa0101181514/tw-legal-rag'
               url = 'https://tlr.dr-legal.com.tw/mcp'
               emit('initialize_request', server=label, transport='streamable-http', url=url)
               try:
-                  async with streamablehttp_client(url, timeout=timedelta(seconds=30), sse_read_timeout=timedelta(seconds=70)) as (read, write, _):
-                      async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=65)) as session:
-                          init = await asyncio.wait_for(session.initialize(), 40)
-                          emit('initialize_response', server=label, response=init.model_dump(mode='json'))
+                  async with streamablehttp_client(url, timeout=timedelta(seconds=30), sse_read_timeout=timedelta(seconds=75)) as (read, write, _):
+                      async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=70)) as session:
+                          result = await asyncio.wait_for(session.initialize(), 40)
+                          emit('initialize_response', server=label, response=result.model_dump(mode='json'))
                           tools = await session.list_tools()
-                          schemas = {tool.name: tool.inputSchema for tool in tools.tools}
+                          schemas = {t.name: t.inputSchema for t in tools.tools}
                           emit('tools_list_response', server=label, tools=schemas)
                           if 'get_legal_reference' in schemas:
                               await call(session, label, 'get_legal_reference', {'serial': '勞動2字第1020083156號'})
                           name = 'search_bundle' if 'search_bundle' in schemas else 'search_judgments'
                           if name in schemas:
-                              properties = schemas[name].get('properties', {})
-                              key = 'query' if 'query' in properties else 'keyword'
-                              arguments = {key: '月薪制勞工月中到職，未約定未足月工資換算分母。法院如何判斷按30日或當月實際31日計算？民法第123條與公司計薪慣例。'}
-                              for field, value in [('max_results', 5), ('read_top', 3)]:
-                                  if field in properties:
-                                      arguments[field] = value
-                              await call(session, label, name, arguments)
+                              await call(session, label, name, query_args(schemas[name], '月薪制勞工月中到職，未約定未足月工資換算分母。法院如何判斷按30日或當月實際31日計算？民法第123條與公司計薪慣例。'))
                           if 'search_judgments' in schemas:
-                              properties = schemas['search_judgments'].get('properties', {})
-                              key = 'query' if 'query' in properties else 'keyword'
-                              await call(session, label, 'search_judgments', {key: '臺北高等行政法院110年度訴字第1335號'})
+                              await call(session, label, 'search_judgments', query_args(schemas['search_judgments'], '臺北高等行政法院110年度訴字第1335號', 2))
+                          if name in schemas:
+                              await call(session, label, name, query_args(schemas[name], '新進勞工第一次領薪立即提出異議，公司長期薪資計算慣例但未告知，是否構成默示合意或企業習慣？', 4))
               except Exception as exc:
                   emit('server_error', server=label, error=repr(exc), traceback=traceback.format_exc())
-          
           async def local():
               label = 'lawchat-oss/mcp-taiwan-legal-db'
               emit('initialize_request', server=label, transport='stdio', command='mcp-taiwan-legal-db')
               try:
-                  params = StdioServerParameters(command='mcp-taiwan-legal-db', args=[])
-                  async with stdio_client(params) as (read, write):
-                      async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=65)) as session:
-                          init = await asyncio.wait_for(session.initialize(), 50)
-                          emit('initialize_response', server=label, response=init.model_dump(mode='json'))
-                          listing = await session.list_tools()
-                          emit('tools_list_response', server=label, tools=[t.name for t in listing.tools])
+                  async with stdio_client(StdioServerParameters(command='mcp-taiwan-legal-db', args=[])) as (read, write):
+                      async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=70)) as session:
+                          result = await asyncio.wait_for(session.initialize(), 50)
+                          emit('initialize_response', server=label, response=result.model_dump(mode='json'))
+                          tools = await session.list_tools()
+                          emit('tools_list_response', server=label, tools=[t.name for t in tools.tools])
                           await call(session, label, 'query_regulation', {'law_name': '民法', 'article_no': '123'})
                           result = await call(session, label, 'search_judgments', {'court': '臺北高等行政法院', 'case_type': '行政', 'year_from': 110, 'case_word': '訴', 'case_number': '1335', 'max_results': 3})
                           if isinstance(result, dict):
                               rows = result.get('results') or []
                               if rows and isinstance(rows[0], dict) and rows[0].get('jid'):
                                   await call(session, label, 'get_judgment', {'jid': rows[0]['jid']})
-                          await call(session, label, 'search_judgments', {'keyword': '未足月', 'case_type': '民事', 'max_results': 3})
+                          result = await call(session, label, 'search_judgments', {'keyword': '未足月', 'case_type': '民事', 'max_results': 3})
+                          if isinstance(result, dict):
+                              rows = result.get('results') or []
+                              if rows and isinstance(rows[0], dict) and rows[0].get('jid'):
+                                  await call(session, label, 'get_judgment', {'jid': rows[0]['jid']})
               except Exception as exc:
                   emit('server_error', server=label, error=repr(exc), traceback=traceback.format_exc())
-          
           async def main():
-              emit('environment', python=sys.version, packages={name: importlib.metadata.version(name) for name in ['mcp', 'mcp-taiwan-legal-db', 'httpx', 'playwright']}, upstream_commit='03194e7b0a7437c7ed5e281d6d92c4a6df66ac65')
+              emit('environment', python=sys.version, packages={n: importlib.metadata.version(n) for n in ['mcp', 'mcp-taiwan-legal-db', 'httpx', 'playwright']}, upstream_commit='03194e7b0a7437c7ed5e281d6d92c4a6df66ac65')
               try:
-                  await asyncio.wait_for(asyncio.gather(remote(), local()), timeout=260)
+                  await asyncio.wait_for(asyncio.gather(remote(), local()), timeout=285)
               except Exception as exc:
                   emit('overall_error', error=repr(exc))
               finally:
@@ -144,9 +128,7 @@ jobs:
                   (OUT / 'records.json').write_text(raw, encoding='utf-8')
                   print('FULL_RECORDS_GZIP_BASE64=' + base64.b64encode(gzip.compress(raw.encode())).decode(), flush=True)
                   print('FINISHED', flush=True)
-          
-          if __name__ == '__main__':
-              asyncio.run(main())
+          asyncio.run(main())
           PY
       - name: Preserve exact MCP requests and responses
         if: always()
