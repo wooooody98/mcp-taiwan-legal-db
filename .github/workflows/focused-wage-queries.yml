@@ -1,0 +1,55 @@
+name: Verify full wage judgments through MCP
+on:
+  push:
+    branches: [diagnostics/two-legal-mcp-20260913]
+    paths: [.github/workflows/focused-wage-queries.yml]
+permissions:
+  contents: read
+jobs:
+  read-judgments:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Install pinned original MCP server
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --disable-pip-version-check 'mcp>=1.12,<2' 'git+https://github.com/lawchat-oss/mcp-taiwan-legal-db.git@03194e7b0a7437c7ed5e281d6d92c4a6df66ac65'
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - name: Install browser support
+        continue-on-error: true
+        run: timeout 100s python -m playwright install --with-deps chromium
+      - name: Read six real judgment full texts via MCP
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir -p focused-results
+          python -u - <<'PY'
+          import asyncio,json,pathlib
+          from datetime import datetime,timedelta,timezone
+          from mcp import ClientSession,StdioServerParameters
+          from mcp.client.stdio import stdio_client
+          out=pathlib.Path('focused-results');records=[]
+          def log(event,**data):
+              row={'utc':datetime.now(timezone.utc).isoformat(),'event':event,**data};records.append(row)
+              with (out/'records.jsonl').open('a') as f:f.write(json.dumps(row,ensure_ascii=False)+'\n')
+              print(json.dumps(row,ensure_ascii=False)[:3500],flush=True)
+          async def main():
+              async with stdio_client(StdioServerParameters(command='mcp-taiwan-legal-db',args=[])) as (rd,wr):
+                  async with ClientSession(rd,wr,read_timeout_seconds=timedelta(seconds=45)) as s:
+                      r=await s.initialize();log('initialize_response',response=r.model_dump(mode='json'))
+                      jids=['PCDV,110,勞訴,248,20220524,1','PCDV,107,勞訴,170,20181204,1','TPDV,112,重勞訴,58,20240412,1','TPDV,109,勞訴,50,20210113,1','PCDV,111,勞簡上,7,20220826,1','KSDV,95,勞訴,85,20070122,2']
+                      for jid in jids:
+                          log('tools_call_request',tool='get_judgment',arguments={'jid':jid})
+                          try:
+                              r=await asyncio.wait_for(s.call_tool('get_judgment',{'jid':jid}),40)
+                              log('tools_call_response',tool='get_judgment',jid=jid,response=r.model_dump(mode='json'))
+                          except Exception as e:log('tools_call_error',jid=jid,error=type(e).__name__)
+              (out/'records.json').write_text(json.dumps(records,ensure_ascii=False,indent=2))
+          asyncio.run(main())
+          PY
+      - name: Preserve full original judgments
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: focused-wage-judgments
+          path: ${{ runner.temp }}/focused-results
+          retention-days: 7
