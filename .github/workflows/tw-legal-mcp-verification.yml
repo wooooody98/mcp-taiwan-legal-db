@@ -14,7 +14,7 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 12
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,8 +27,8 @@ jobs:
       - name: Install browser used by official MCP client
         timeout-minutes: 3
         run: python -m playwright install --with-deps chromium
-      - name: Query wage calculation and implied agreement precedents through MCP
-        timeout-minutes: 8
+      - name: Retrieve identified wage judgments through actual MCP calls
+        timeout-minutes: 6
         run: |
           python -u - <<'PY'
           import sys, traceback
@@ -36,22 +36,14 @@ jobs:
           import mcp_probe as p
           c=None
           try:
-              c=p.StdioMCP(); p.init(c,'mcp-taiwan-legal-db')
-              seen=set()
-              queries=[
-                  {'keyword':'1020083156','max_results':8},
-                  {'keyword':'未足月','case_type':'民事','max_results':8},
-                  {'court':'最高法院','case_type':'民事','year_from':106,'case_word':'台上','case_number':'1901','max_results':2},
-                  {'court':'臺灣新北地方法院','case_type':'民事','year_from':112,'case_word':'勞訴','case_number':'129','max_results':2}
-              ]
-              for q in queries:
-                  d=p.call(c,'mcp-taiwan-legal-db','search_judgments',q)
-                  if isinstance(d,dict):
-                      for row in d.get('results',[])[:4]:
-                          jid=row.get('jid')
-                          if jid and jid not in seen:
-                              seen.add(jid)
-                              p.call(c,'mcp-taiwan-legal-db','get_judgment',{'jid':jid})
+              c=p.StdioMCP();p.init(c,'mcp-taiwan-legal-db')
+              for jid in ['KLDV,115,基勞簡,1,20260715,1','TPDV,114,勞訴,133,20260612,1']:
+                  p.call(c,'mcp-taiwan-legal-db','get_judgment',{'jid':jid})
+              d=p.call(c,'mcp-taiwan-legal-db','search_judgments',{'keyword':'第123條','case_type':'民事','case_word':'勞訴','max_results':10})
+              if isinstance(d,dict):
+                  for row in d.get('results',[])[:4]:
+                      if row.get('jid'):
+                          p.call(c,'mcp-taiwan-legal-db','get_judgment',{'jid':row['jid']})
           except Exception:
               p.record('mcp-taiwan-legal-db','fatal_error',traceback.format_exc())
           finally:
