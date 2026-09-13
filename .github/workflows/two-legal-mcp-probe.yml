@@ -1,0 +1,158 @@
+name: Two Taiwan Legal MCP live probe
+
+on:
+  push:
+    branches: [diagnostics/two-legal-mcp-20260913]
+    paths: [.github/workflows/two-legal-mcp-probe.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: two-legal-mcp-diagnostics
+  cancel-in-progress: true
+
+jobs:
+  live-probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      MCP_RESULTS_DIR: ${{ runner.temp }}/two-legal-mcp-results
+    steps:
+      - name: Install the upstream MCP server in an isolated environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/mcp-venv"
+          "$RUNNER_TEMP/mcp-venv/bin/python" -m pip install --disable-pip-version-check 'mcp>=1.12,<2' 'git+https://github.com/lawchat-oss/mcp-taiwan-legal-db.git@03194e7b0a7437c7ed5e281d6d92c4a6df66ac65'
+          echo "$RUNNER_TEMP/mcp-venv/bin" >> "$GITHUB_PATH"
+      - name: Install browser support for the official judicial site
+        continue-on-error: true
+        run: timeout 120s python -m playwright install --with-deps chromium
+      - name: Initialize both real MCP servers and run anonymous legal queries
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -u - <<'PY'
+          """Exercise both real MCP transports using anonymous legal research queries."""
+          import asyncio
+          import base64
+          import gzip
+          import importlib.metadata
+          import json
+          import os
+          import pathlib
+          import sys
+          import traceback
+          from datetime import datetime, timedelta, timezone
+          
+          from mcp import ClientSession, StdioServerParameters
+          from mcp.client.stdio import stdio_client
+          from mcp.client.streamable_http import streamablehttp_client
+          
+          OUT = pathlib.Path(os.environ.get('MCP_RESULTS_DIR', 'mcp-results'))
+          OUT.mkdir(parents=True, exist_ok=True)
+          records = []
+          
+          def emit(event, **data):
+              row = {'utc': datetime.now(timezone.utc).isoformat(), 'event': event, **data}
+              records.append(row)
+              line = json.dumps(row, ensure_ascii=False, default=str)
+              with (OUT / 'records.jsonl').open('a', encoding='utf-8') as f:
+                  f.write(line + '\n')
+              print(line if len(line) <= 28000 else line[:28000] + ' [preview only; complete response in artifact]', flush=True)
+          
+          def unpack(result):
+              data = result.model_dump(mode='json')
+              if isinstance(data.get('structuredContent'), dict):
+                  return data['structuredContent']
+              for part in data.get('content', []):
+                  if part.get('type') == 'text':
+                      try:
+                          return json.loads(part['text'])
+                      except (ValueError, TypeError):
+                          pass
+              return data
+          
+          async def call(session, label, name, arguments):
+              emit('tools_call_request', server=label, tool=name, arguments=arguments)
+              try:
+                  result = await asyncio.wait_for(session.call_tool(name, arguments), 60)
+                  emit('tools_call_response', server=label, tool=name, response=result.model_dump(mode='json'))
+                  return unpack(result)
+              except Exception as exc:
+                  emit('tools_call_error', server=label, tool=name, error=repr(exc))
+                  return None
+          
+          async def remote():
+              label = 'aa0101181514/tw-legal-rag'
+              url = 'https://tlr.dr-legal.com.tw/mcp'
+              emit('initialize_request', server=label, transport='streamable-http', url=url)
+              try:
+                  async with streamablehttp_client(url, timeout=timedelta(seconds=30), sse_read_timeout=timedelta(seconds=70)) as (read, write, _):
+                      async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=65)) as session:
+                          init = await asyncio.wait_for(session.initialize(), 40)
+                          emit('initialize_response', server=label, response=init.model_dump(mode='json'))
+                          tools = await session.list_tools()
+                          schemas = {tool.name: tool.inputSchema for tool in tools.tools}
+                          emit('tools_list_response', server=label, tools=schemas)
+                          if 'get_legal_reference' in schemas:
+                              await call(session, label, 'get_legal_reference', {'serial': '勞動2字第1020083156號'})
+                          name = 'search_bundle' if 'search_bundle' in schemas else 'search_judgments'
+                          if name in schemas:
+                              properties = schemas[name].get('properties', {})
+                              key = 'query' if 'query' in properties else 'keyword'
+                              arguments = {key: '月薪制勞工月中到職，未約定未足月工資換算分母。法院如何判斷按30日或當月實際31日計算？民法第123條與公司計薪慣例。'}
+                              for field, value in [('max_results', 5), ('read_top', 3)]:
+                                  if field in properties:
+                                      arguments[field] = value
+                              await call(session, label, name, arguments)
+                          if 'search_judgments' in schemas:
+                              properties = schemas['search_judgments'].get('properties', {})
+                              key = 'query' if 'query' in properties else 'keyword'
+                              await call(session, label, 'search_judgments', {key: '臺北高等行政法院110年度訴字第1335號'})
+              except Exception as exc:
+                  emit('server_error', server=label, error=repr(exc), traceback=traceback.format_exc())
+          
+          async def local():
+              label = 'lawchat-oss/mcp-taiwan-legal-db'
+              emit('initialize_request', server=label, transport='stdio', command='mcp-taiwan-legal-db')
+              try:
+                  params = StdioServerParameters(command='mcp-taiwan-legal-db', args=[])
+                  async with stdio_client(params) as (read, write):
+                      async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=65)) as session:
+                          init = await asyncio.wait_for(session.initialize(), 50)
+                          emit('initialize_response', server=label, response=init.model_dump(mode='json'))
+                          listing = await session.list_tools()
+                          emit('tools_list_response', server=label, tools=[t.name for t in listing.tools])
+                          await call(session, label, 'query_regulation', {'law_name': '民法', 'article_no': '123'})
+                          result = await call(session, label, 'search_judgments', {'court': '臺北高等行政法院', 'case_type': '行政', 'year_from': 110, 'case_word': '訴', 'case_number': '1335', 'max_results': 3})
+                          if isinstance(result, dict):
+                              rows = result.get('results') or []
+                              if rows and isinstance(rows[0], dict) and rows[0].get('jid'):
+                                  await call(session, label, 'get_judgment', {'jid': rows[0]['jid']})
+                          await call(session, label, 'search_judgments', {'keyword': '未足月', 'case_type': '民事', 'max_results': 3})
+              except Exception as exc:
+                  emit('server_error', server=label, error=repr(exc), traceback=traceback.format_exc())
+          
+          async def main():
+              emit('environment', python=sys.version, packages={name: importlib.metadata.version(name) for name in ['mcp', 'mcp-taiwan-legal-db', 'httpx', 'playwright']}, upstream_commit='03194e7b0a7437c7ed5e281d6d92c4a6df66ac65')
+              try:
+                  await asyncio.wait_for(asyncio.gather(remote(), local()), timeout=260)
+              except Exception as exc:
+                  emit('overall_error', error=repr(exc))
+              finally:
+                  raw = json.dumps(records, ensure_ascii=False, indent=2, default=str)
+                  (OUT / 'records.json').write_text(raw, encoding='utf-8')
+                  print('FULL_RECORDS_GZIP_BASE64=' + base64.b64encode(gzip.compress(raw.encode())).decode(), flush=True)
+                  print('FINISHED', flush=True)
+          
+          if __name__ == '__main__':
+              asyncio.run(main())
+          PY
+      - name: Preserve exact MCP requests and responses
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: two-legal-mcp-raw-results
+          path: ${{ runner.temp }}/two-legal-mcp-results
+          retention-days: 7
+          if-no-files-found: warn
