@@ -1,0 +1,67 @@
+name: Focused wage case MCP verification
+on:
+  push:
+    branches: [diagnostics/two-legal-mcp-20260913]
+    paths: [.github/workflows/two-legal-mcp-focused.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install isolated upstream server
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --disable-pip-version-check 'mcp>=1.12,<2' pyyaml 'git+https://github.com/lawchat-oss/mcp-taiwan-legal-db.git@03194e7b0a7437c7ed5e281d6d92c4a6df66ac65'
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - name: Read exact judgments through both MCPs
+        env:
+          MCP_RESULTS_DIR: ${{ runner.temp }}/focused-mcp-results
+        run: |
+          python -u - <<'PY'
+          import pathlib, yaml
+          # Reuse the already tested client, OAuth PKCE and safe logging helpers.
+          workflow=yaml.safe_load(pathlib.Path('.github/workflows/two-legal-mcp-probe.yml').read_text())
+          step=next(s for s in workflow['jobs']['live-probe']['steps'] if s.get('name')=='Authorized MCP connections and focused wage queries')
+          source=step['run'].split("<<'PY'\n",1)[1].rsplit('\nPY',1)[0]
+          source=source.rsplit('asyncio.run(main())',1)[0]
+          exec(compile(source,'verified_mcp_helpers.py','exec'))
+          async def official():
+              label='lawchat-oss/mcp-taiwan-legal-db'
+              try:
+                  async with stdio_client(StdioServerParameters(command='mcp-taiwan-legal-db',args=[])) as (read,write):
+                      async with ClientSession(read,write,read_timeout_seconds=timedelta(seconds=70)) as s:
+                          r=await s.initialize();emit('initialize_response',server=label,response=r.model_dump(mode='json'))
+                          for jid in ['TPDV,112,重勞訴,58,20240412,1','TPDV,109,勞訴,50,20210113,1','PCDV,111,勞簡上,7,20220826,1','TPDV,93,勞簡上,51,20041215,1']:
+                              await call(s,label,'get_judgment',{'jid':jid})
+              except Exception as e:emit('server_error',server=label,error=repr(e))
+          async def semantic():
+              label='aa0101181514/tw-legal-rag'
+              try:
+                  headers=await authorize()
+                  async with streamablehttp_client('https://tlr.dr-legal.com.tw/mcp',headers=headers,timeout=timedelta(seconds=30),sse_read_timeout=timedelta(seconds=75)) as (read,write,_):
+                      async with ClientSession(read,write,read_timeout_seconds=timedelta(seconds=70)) as s:
+                          r=await s.initialize();emit('initialize_response',server=label,response=r.model_dump(mode='json'))
+                          for query in ['臺灣臺北地方法院112年度重勞訴字第58號','臺灣臺北地方法院109年度勞訴字第50號','臺灣臺北地方法院114年度勞訴字第133號']:
+                              await call(s,label,'search_judgments',{'query':query,'max_results':1})
+                          await call(s,label,'search_bundle',{'query':'破月','search_type':'keyword','max_results':5,'read_top':5})
+              except Exception as e:emit('server_error',server=label,error=repr(e))
+          async def focused():
+              try:await asyncio.wait_for(asyncio.gather(official(),semantic()),timeout=220)
+              except Exception as e:emit('overall_error',error=repr(e))
+              finally:
+                  (OUT/'records.json').write_text(json.dumps(records,ensure_ascii=False,indent=2,default=str),encoding='utf-8')
+                  print('FOCUSED_MCP_FINISHED',flush=True)
+          asyncio.run(focused())
+          PY
+      - name: Preserve complete case-query results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: focused-wage-mcp-results
+          path: ${{ runner.temp }}/focused-mcp-results
+          retention-days: 7
+          if-no-files-found: warn
