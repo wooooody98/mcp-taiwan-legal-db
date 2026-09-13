@@ -22,8 +22,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install official legal MCP package
-        run: python -m pip install --disable-pip-version-check 'mcp-taiwan-legal-db==1.0.1' requests
+      - name: Install verified upstream legal MCP source
+        run: python -m pip install --disable-pip-version-check 'git+https://github.com/lawchat-oss/mcp-taiwan-legal-db.git@03194e7b0a7437c7ed5e281d6d92c4a6df66ac65' requests
       - name: Install browser used by official MCP client
         timeout-minutes: 3
         run: python -m playwright install --with-deps chromium
